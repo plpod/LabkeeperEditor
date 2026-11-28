@@ -30,6 +30,7 @@ import {
     resolveProjectFileName,
 } from '../utils/projectFilePath.ts';
 import { resolveSegmentId } from '../utils/segmentId.ts';
+import { retryWhileLocked } from '../utils/retryWhileLocked.ts';
 import { segmentCreateEvent, trackEvent } from '../utils/observerContext.ts';
 import { createRateLimiter } from '../utils/rateLimit.ts';
 import {
@@ -965,9 +966,9 @@ export class ProgramEditorService {
                   ),
                   line: target.line,
               };
-        const result = await this.rpi.navigationDocToPdfRequest(
-            project.projectId,
-            requestBody
+        // сразу после прогона сервер ещё держит сессию LaTeX и отвечает 423
+        const result = await retryWhileLocked(() =>
+            this.rpi.navigationDocToPdfRequest(project.projectId, requestBody)
         );
         // пока шёл запрос, человек мог уйти в другой проект: его PDF не трогаем
         const current = this.repository.projectViewModelRepository.project();

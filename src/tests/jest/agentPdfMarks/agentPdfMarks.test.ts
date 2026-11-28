@@ -191,18 +191,57 @@ describe('места правок по навигации', () => {
         ]);
     });
 
-    test('занятый проект останавливает поиск', async () => {
+    test('проект занят и после повторов: поиск останавливается', async () => {
         const request = navigation({}, failed(423));
+
+        const lookup = await new NavigationMarkLocator(
+            { navigationDocToPdfRequest: request } as unknown as Rpi,
+            [0, 0]
+        ).locate(PROJECT_ID, [range, { ...range, hunkId: 'b' }]);
+
+        expect(lookup).toMatchObject({ outcome: 'unavailable', code: 423 });
+        // по запросу и два повтора на каждую из двух правок, начатых разом
+        expect(request.mock.calls.length).toBeLessThanOrEqual(6);
+    });
+
+    // на проде сразу после прогона агента сервер ещё держит сессию LaTeX:
+    // «Latex session is locked. Try again later.»
+    test('сразу после прогона проект ещё занят: запрос повторяется, и место находится', async () => {
+        const positions = navigation({
+            '2:3': { page: 1, x: 70, y: 200 },
+            '2:5': { page: 1, x: 70, y: 260 },
+        });
+        let locked = true;
+        const request = jest.fn(
+            async (...args: Parameters<typeof positions>) => {
+                if (locked) {
+                    locked = false;
+                    return failed(423);
+                }
+                return positions(...args);
+            }
+        );
+
+        const lookup = await new NavigationMarkLocator(
+            { navigationDocToPdfRequest: request } as unknown as Rpi,
+            [0, 0]
+        ).locate(PROJECT_ID, [range]);
+
+        expect(lookup.outcome).toBe('located');
+        expect(
+            lookup.outcome === 'located' && lookup.marks[0].mark?.top
+        ).toEqual({ page: 1, x: 70, y: 200 - LINE_ASCENT_PT });
+        expect(lookup.requests).toBe(4);
+    });
+
+    test('сбой на первой строке правки не даёт ей места: её ищут снова', async () => {
+        const request = navigation({}, failed(500));
 
         const lookup = await new NavigationMarkLocator({
             navigationDocToPdfRequest: request,
-        } as unknown as Rpi).locate(PROJECT_ID, [
-            range,
-            { ...range, hunkId: 'b' },
-        ]);
+        } as unknown as Rpi).locate(PROJECT_ID, [range]);
 
-        expect(lookup).toMatchObject({ outcome: 'unavailable', code: 423 });
-        expect(request.mock.calls.length).toBeLessThanOrEqual(2);
+        expect(lookup).toEqual({ outcome: 'located', marks: [], requests: 1 });
     });
 });
 
@@ -400,6 +439,25 @@ describe('сервис отметок', () => {
         expect(
             ctx.repository.ideViewModelRepository.agentPdfMarks()
         ).toBeNull();
+    });
+
+    test('правку, на которой сервер дал сбой, следующее обновление ищет снова', async () => {
+        const ctx = setup(POSITIONS);
+        const positions = navigation(POSITIONS);
+        let failing = true;
+        ctx.rpi.navigationDocToPdfRequest = jest.fn(
+            async (...args: Parameters<typeof positions>) =>
+                failing && args[1].segmentId === 2
+                    ? failed(500)
+                    : positions(...args)
+        ) as unknown as Rpi['navigationDocToPdfRequest'];
+
+        await ctx.agentPdfMarksService.refresh();
+        expect(markedHunks(ctx)).toEqual(['a']);
+
+        failing = false;
+        await ctx.agentPdfMarksService.refresh();
+        expect(markedHunks(ctx)).toEqual(['a', 'b']);
     });
 
     test('щелчок по отметке открывает правку в редакторе с её первой строки', async () => {

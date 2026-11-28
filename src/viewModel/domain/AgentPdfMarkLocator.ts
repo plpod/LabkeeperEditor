@@ -1,5 +1,9 @@
 import type { PdfPosition, Rpi } from '../../model/rpi';
 import type { AgentChangeRange } from '../utils/agentChangeRanges.ts';
+import {
+    LOCK_RETRY_DELAYS_MS,
+    retryWhileLocked,
+} from '../utils/retryWhileLocked.ts';
 
 /**
  * GH-190: где в собранном PDF лежит правка агента: от верхнего края первой
@@ -22,7 +26,11 @@ export interface AgentPdfMarks {
 export type AgentPdfMarkLookup =
     | {
           outcome: 'located';
-          /** На каждую правку: место в PDF или null, если сервер о её строках не знает */
+          /**
+           * Место в PDF или null, если сервер о строках правки не знает (410).
+           * Правки, на которые сервер ответил сбоем, сюда не попадают: их
+           * ищут снова при следующем обновлении
+           */
           marks: { hunkId: string; mark: AgentPdfMark | null }[];
           requests: number;
       }
@@ -60,8 +68,15 @@ export const LINE_DESCENT_PT = 4;
  */
 const MAX_TAIL_PT = 120;
 
-/** Ответы, после которых спрашивать про остальные правки бессмысленно. 410 сервер отдаёт и на строку чужого файла, поэтому он не здесь */
+/**
+ * Ответы, после которых спрашивать про остальные правки бессмысленно. 423
+ * сюда попадает только после повторов: сразу после прогона агента сервер
+ * ещё доли секунды держит сессию LaTeX и отвечает 423 на первый же запрос
+ */
 const STOP_CODES = new Set([401, 403, 423]);
+
+/** Сервер не знает этих строк в собранном PDF: неизвестный сегмент, файл вне документа */
+const HTTP_GONE = 410;
 
 /** Запросов навигации одновременно: правок бывает несколько десятков */
 const CONCURRENCY = 4;
@@ -72,13 +87,23 @@ class LookupStopped extends Error {
     }
 }
 
+/** Сбой на одной правке: её место неизвестно, и запоминать тут нечего */
+class RangeUnknown extends Error {
+    constructor(readonly code: number) {
+        super(`navigation failed with ${code}`);
+    }
+}
+
 /**
  * Места правок по запросам навигации: первая строка правки, последняя и
  * строка сразу после неё. На строку без своего вывода (пустую, комментарий,
  * \begin) сервер отвечает местом следующего текста, так что промахов нет
  */
 export class NavigationMarkLocator implements AgentPdfMarkLocator {
-    constructor(private rpi: Rpi) {}
+    constructor(
+        private rpi: Rpi,
+        private lockRetryDelays: readonly number[] = LOCK_RETRY_DELAYS_MS
+    ) {}
 
     async locate(
         projectId: string,
@@ -87,20 +112,27 @@ export class NavigationMarkLocator implements AgentPdfMarkLocator {
         let requests = 0;
         let stopCode: number | null = null;
 
+        /**
+         * Место строки. Сбой на первой строке правки делает её место
+         * неизвестным, а на последней и следующей только сужает отметку
+         */
         const positionOf = async (
             range: AgentChangeRange,
-            line: number
+            line: number,
+            required = false
         ): Promise<PdfPosition | null> => {
             if (stopCode !== null) {
                 throw new LookupStopped(stopCode);
             }
-            requests += 1;
-            const result = await this.rpi.navigationDocToPdfRequest(
-                projectId,
-                range.file
-                    ? { file: range.file, line }
-                    : { segmentId: range.segmentId, line }
-            );
+            const result = await retryWhileLocked(() => {
+                requests += 1;
+                return this.rpi.navigationDocToPdfRequest(
+                    projectId,
+                    range.file
+                        ? { file: range.file, line }
+                        : { segmentId: range.segmentId, line }
+                );
+            }, this.lockRetryDelays);
             if (result.isOk && result.body) {
                 return result.body;
             }
@@ -108,13 +140,16 @@ export class NavigationMarkLocator implements AgentPdfMarkLocator {
                 stopCode ??= result.code;
                 throw new LookupStopped(result.code);
             }
+            if (required && result.code !== HTTP_GONE) {
+                throw new RangeUnknown(result.code);
+            }
             return null;
         };
 
         const markOf = async (
             range: AgentChangeRange
         ): Promise<AgentPdfMark | null> => {
-            const start = await positionOf(range, range.startLine);
+            const start = await positionOf(range, range.startLine, true);
             if (!start) {
                 return null;
             }
@@ -141,12 +176,25 @@ export class NavigationMarkLocator implements AgentPdfMarkLocator {
             const marks = await mapWithConcurrency(
                 ranges,
                 CONCURRENCY,
-                async (range) => ({
-                    hunkId: range.hunkId,
-                    mark: await markOf(range),
-                })
+                async (range) => {
+                    try {
+                        return {
+                            hunkId: range.hunkId,
+                            mark: await markOf(range),
+                        };
+                    } catch (error) {
+                        if (error instanceof RangeUnknown) {
+                            return null;
+                        }
+                        throw error;
+                    }
+                }
             );
-            return { outcome: 'located', marks, requests };
+            return {
+                outcome: 'located',
+                marks: marks.filter((item) => item !== null),
+                requests,
+            };
         } catch (error) {
             if (error instanceof LookupStopped) {
                 return { outcome: 'unavailable', code: error.code, requests };

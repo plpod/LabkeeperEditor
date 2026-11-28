@@ -47,7 +47,9 @@ const BASELINES: Record<number, number> = { 2: 46, 3: 60, 4: 400 };
 
 async function openProjectWithAgentChange(
     page: Page,
-    path = `/project/${uuid}`
+    path = `/project/${uuid}`,
+    /** Сколько первых запросов навигации получат 423: так прод отвечает сразу после прогона агента */
+    lockedRequests = 0
 ) {
     const routeSetup = new RouteSetup(page);
     await routeSetup.setupGetUserInfoRequest();
@@ -80,6 +82,15 @@ async function openProjectWithAgentChange(
             };
             lines.push(line);
             await released;
+            if (lockedRequests > 0) {
+                lockedRequests -= 1;
+                await route.fulfill({
+                    status: 423,
+                    contentType: 'text/plain',
+                    body: 'Latex session is locked. Try again later.',
+                });
+                return;
+            }
             await route.fulfill({
                 json: { page: 1, x: 72, y: BASELINES[line] ?? 800 },
             });
@@ -248,4 +259,19 @@ test('agent-mark-click-leaves-agent-mode-for-the-editor', async ({ page }) => {
     await expect
         .poll(() => focusedEditorLine(page))
         .toBe('Short line for selection');
+});
+
+test('agent-mark-appears-in-agent-mode-once-the-latex-session-unlocks', async ({
+    page,
+}) => {
+    const { release } = await openProjectWithAgentChange(
+        page,
+        `/project/${uuid}/agent`,
+        1
+    );
+    release();
+
+    await expect(firstPageMark(page)).toHaveCount(1, PDF_RENDER);
+    const placement = await markPlacement(page);
+    expect(placement?.top).toBeCloseTo((46 - 12) / PAGE_HEIGHT_PT, 2);
 });

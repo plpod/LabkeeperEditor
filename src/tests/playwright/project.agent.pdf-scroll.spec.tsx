@@ -88,7 +88,12 @@ const pdfPlacement = (page: Page, pageIndex: number, text: string) =>
         [pageIndex, text] as const
     );
 
-async function openAgentRun(page: Page, navigationStatus = 200) {
+async function openAgentRun(
+    page: Page,
+    navigationStatus = 200,
+    /** Сколько миллисекунд после первого запроса навигация отвечает 423: так прод отвечает сразу после прогона агента */
+    lockedForMs = 0
+) {
     const routeSetup = new RouteSetup(page);
     await routeSetup.setupGetUserInfoRequest();
     await routeSetup.acceptCrossBorderConsentLocally();
@@ -116,8 +121,17 @@ async function openAgentRun(page: Page, navigationStatus = 200) {
     );
     // SyncTeX отвечает местом правки в собранном документе: третья страница
     const navigation: unknown[] = [];
+    let firstRequestAt: number | null = null;
     await page.route(`**/public/project/${uuid}/navigation/pdf`, (route) => {
         navigation.push(route.request().postDataJSON());
+        firstRequestAt ??= Date.now();
+        if (Date.now() - firstRequestAt < lockedForMs) {
+            return route.fulfill({
+                status: 423,
+                contentType: 'text/plain',
+                body: 'Latex session is locked. Try again later.',
+            });
+        }
         return navigationStatus === 200
             ? // базовая линия первой строки страницы: поле 3 мм и шрифт 12 pt
               route.fulfill({ json: { page: 3, x: 72, y: 20 } })
@@ -151,6 +165,26 @@ test('after-the-run-the-pdf-shows-the-last-agent-change', async ({ page }) => {
     // спросили место первой строки последней правки
     expect(navigation).toContainEqual({ segmentId: 1, line: 3 });
     // GH-190: правка отмечена на той странице, куда встал PDF
+    await expect(
+        page.locator('[data-pdf-page="2"] > .pdf-agent-mark')
+    ).toHaveCount(1);
+});
+
+test('pdf-shows-the-last-agent-change-once-the-latex-session-unlocks', async ({
+    page,
+}) => {
+    await openAgentRun(page, 200, 300);
+
+    await expect
+        .poll(async () => {
+            const placement = await pdfPlacement(page, 2, THIRD_PAGE_LINE);
+            return (
+                placement !== null &&
+                Math.abs(placement.pageOffset) < 40 &&
+                placement.lineVisible
+            );
+        }, PDF_RENDER)
+        .toBe(true);
     await expect(
         page.locator('[data-pdf-page="2"] > .pdf-agent-mark')
     ).toHaveCount(1);
